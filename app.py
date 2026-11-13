@@ -96,7 +96,7 @@ def next_button(label: str, disabled: bool = False, help: str | None = None):
 
 # ---------- ホーム ----------
 def page_home():
-    st.title("清掃勤務表")
+    st.title("清掃勤務表 大規模版（試作）")
     st.write("休みの希望を確かめて、全館の勤務表をつくりましょう。")
     rows = []
     for b in BUILDINGS:
@@ -317,7 +317,7 @@ def step4():
     for col, (k, v) in zip((m3, m4, m5), fair.items()):
         col.metric(k, v, help=helps[k])
     if must:
-        st.error("赤だけ見れば確定できます。黄はできれば直す、くらいで大丈夫です。")
+        st.error("赤を直せば確定できます。黄はできれば直す、くらいで大丈夫です。")
     else:
         st.success("「必ず」はすべて守れています。黄はできれば直す、くらいで確定できます。")
 
@@ -356,7 +356,7 @@ def step4():
     tab1, tab2 = st.tabs(["見る", "手直しする"])
     with tab1:
         sty, _ = styled_grid(ss.assign, staff, ss.highlight)
-        st.dataframe(sty, hide_index=True, width="stretch", height=min(900, 38 + 35 * len(staff)), column_config={"名前": st.column_config.Column(pinned=True)})
+        st.dataframe(sty, hide_index=True, width="stretch", height=min(900, 38 + 35 * len(staff)), column_config={"名前": st.column_config.Column(pinned=True, width="medium")})
     with tab2:
         if not can_edit:
             st.write("見るだけの権限です。")
@@ -364,7 +364,7 @@ def step4():
             cols = [fmt_date(d) for d in dates]
             edf = pd.DataFrame([{"名前": s.name, **{cols[d]: ss.assign[(s.sid, d)] for d in range(fac.days)}} for s in staff])
             cfg = {c: st.column_config.SelectboxColumn(c, options=BUILDINGS + [OFF], width="small") for c in cols}
-            cfg["名前"] = st.column_config.Column(pinned=True, disabled=True)
+            cfg["名前"] = st.column_config.Column(pinned=True, disabled=True, width="medium")
             out = st.data_editor(edf, hide_index=True, column_config=cfg, key="grid_edit", width="stretch", height=min(900, 38 + 35 * len(staff)))
             if st.button("手直しを反映する"):
                 n = 0
@@ -438,7 +438,7 @@ def page_staff():
         ]
     )
     st.write(f"{len(staff)}人")
-    st.dataframe(df, hide_index=True, width="stretch", height=min(900, 38 + 35 * len(df)), column_config={"名前": st.column_config.Column(pinned=True)})
+    st.dataframe(df, hide_index=True, width="stretch", height=min(900, 38 + 35 * len(df)), column_config={"名前": st.column_config.Column(pinned=True, width="medium")})
 
     st.markdown("##### 設定のコピー")
     names = {s.name: s for s in fac.staff}
