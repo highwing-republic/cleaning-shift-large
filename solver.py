@@ -51,8 +51,11 @@ def solve(
     base: dict[tuple[str, int], str] | None = None,
     time_limit: float = 20.0,
     seed: int = 1,
+    weights: dict[str, int] | None = None,
 ) -> Result:
-    """buildings を指定すると、その館の人だけ作り直す（ほかの館の人と応援は base のまま）。"""
+    """buildings を指定すると、その館の人だけ作り直す（ほかの館の人と応援は base のまま）。
+    weights で W の一部を置き換える（画面の「条件の強さ」から）。"""
+    Wt = {**W, **{k: int(v) for k, v in (weights or {}).items()}}
     locked = dict(locked or {})
     target_b = set(buildings or BUILDINGS)
     if base and buildings:
@@ -102,7 +105,7 @@ def solve(
         def val(item):
             return item[1] if item[0] == "p" else work[(s.sid, item[1])]
 
-        for L, weight in ((s.max_consec, None), (s.max_consec - 1, W["consec_soft"])):
+        for L, weight in ((s.max_consec, None), (s.max_consec - 1, Wt["consec_soft"])):
             for i in range(len(seq) - L):
                 win = seq[i : i + L + 1]
                 if all(it[0] == "p" for it in win):
@@ -131,11 +134,11 @@ def solve(
         # できれば休み
         for d in D:
             if fac.requests.get((s.sid, d)) == "できれば休み":
-                pen(W["wish"], work[(s.sid, d)])
+                pen(Wt["wish"], work[(s.sid, d)])
         # 応援
         for d in D:
             for b in s.can_help:
-                pen(W["help"], x[(s.sid, d, b)])
+                pen(Wt["help"], x[(s.sid, d, b)])
         # 週の目安
         for w0 in range(0, fac.days, 7):
             ds = [d for d in D if w0 <= d < w0 + 7]
@@ -144,12 +147,12 @@ def solve(
             target = round(s.week_days * len(ds) / 7)
             m.Add(tot - target <= dev)
             m.Add(target - tot <= dev)
-            pen(W["week"], dev)
+            pen(Wt["week"], dev)
         # 飛び石（休→出→休）
         for d in range(1, fac.days - 1):
             st = m.NewBoolVar("")
             m.Add(st >= work[(s.sid, d)] - work[(s.sid, d - 1)] - work[(s.sid, d + 1)])
-            pen(W["stone"], st)
+            pen(Wt["stone"], st)
 
     # 館ごと・日ごとの人数
     for b in BUILDINGS:
@@ -159,10 +162,10 @@ def solve(
             req = required[b][d]
             short = m.NewIntVar(0, req, "")
             m.Add(tot + short >= req)
-            pen(W["shortage"], short)
+            pen(Wt["shortage"], short)
             over = m.NewIntVar(0, 60, "")
             m.Add(tot - req - 1 <= over)
-            pen(W["over"], over)
+            pen(Wt["over"], over)
             mins = role_minimums(req)
             for role, key in (("リーダー", "leader"), ("チェッカー", "checker")):
                 r = sum(v for s, v in people if s.role == role)
@@ -173,14 +176,14 @@ def solve(
                 ok = sum(v for s, v in people if s.roten in ("○", "△"))
                 sh = m.NewIntVar(0, 1, "")
                 m.Add(ok + sh >= 1)
-                pen(W["roten"], sh)
+                pen(Wt["roten"], sh)
                 for s, v in people:
                     if s.roten == "△":
-                        pen(W["tri"], v)
+                        pen(Wt["tri"], v)
             rookies = sum(v for s, v in people if "新人" in s.groups)
             ro = m.NewIntVar(0, 20, "")
             m.Add(rookies - 2 <= ro)
-            pen(W["rookie"], ro)
+            pen(Wt["rookie"], ro)
 
     # 公平さ
     regulars = [s for s in fac.staff if "社員" in s.groups]
@@ -190,7 +193,7 @@ def solve(
         for r in rests:
             m.Add(hi >= r)
             m.Add(lo <= r)
-        pen(W["fair_rest"], hi - lo)
+        pen(Wt["fair_rest"], hi - lo)
     wk = [d for d, date in enumerate(fac.dates) if is_weekend(date)]
     if wk:
         wrests = [len(wk) - sum(work[(s.sid, d)] for d in wk) for s in fac.staff if not s.off_weekdays]
@@ -198,7 +201,7 @@ def solve(
         for r in wrests:
             m.Add(hi >= r)
             m.Add(lo <= r)
-        pen(W["fair_weekend"], hi - lo)
+        pen(Wt["fair_weekend"], hi - lo)
 
     m.Minimize(sum(penalties))
     solver = cp_model.CpSolver()

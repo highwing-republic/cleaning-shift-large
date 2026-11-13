@@ -93,3 +93,37 @@ def fairness(fac: Facility, assign: dict) -> dict[str, str]:
         "土日祝の休み": f"{min(wrests)}〜{max(wrests)}日" if wrests else "-",
         "できれば休み": f"{got}/{len(want)}件" if want else "-",
     }
+
+
+def precheck(fac: Facility, required: dict[str, list[int]]) -> list[Issue]:
+    """作る前のチェック。休みの希望・出ない曜日だけを見て、はじめから守れない条件を探す。"""
+    issues: list[Issue] = []
+    dates = fac.dates
+
+    def can_work(s, d):
+        return fac.requests.get((s.sid, d)) != "必ず休み" and dates[d].weekday() not in s.off_weekdays
+
+    for b in BUILDINGS:
+        for d in range(fac.days):
+            day = fmt_date(dates[d])
+            req = required[b][d]
+            home = [s for s in fac.staff if s.home == b and can_work(s, d)]
+            anyone = [s for s in fac.staff if (s.home == b or b in s.can_help) and can_work(s, d)]
+            if len(anyone) < req:
+                issues.append(Issue("必ず", "人数", b, d, None, f"{day} {b}：出られる人が {len(anyone)}人で、必要 {req}人に足りません（応援を入れても）"))
+            elif len(home) < req:
+                issues.append(Issue("なるべく", "人数", b, d, None, f"{day} {b}：{b}の人だけでは {req - len(home)}人足りず、応援が要ります"))
+            mins = role_minimums(req)
+            for role in ("リーダー", "チェッカー"):
+                n = sum(s.role == role for s in anyone)
+                if n < mins[role]:
+                    who = "、".join(s.name for s in fac.staff if s.role == role and (s.home == b or b in s.can_help) and not can_work(s, d))
+                    issues.append(Issue("必ず", "役割", b, d, None, f"{day} {b}：出られる{role}が {n}人です（必要 {mins[role]}人）。休みの希望：{who or 'なし'}"))
+            if fac.counts[b][d]["roten"] > 0 and not any(s.roten in ("○", "△") for s in anyone):
+                issues.append(Issue("必ず", "露天", b, d, None, f"{day} {b}：露天風呂付き客室を担当できる人が出られません"))
+    for s in fac.staff:
+        free = sum(can_work(s, d) for d in range(fac.days))
+        target = round(s.week_days * fac.days / 7)
+        if free < target - 1:
+            issues.append(Issue("なるべく", "週の目安", s.home, None, s.sid, f"{s.name}：出られる日が {free}日で、目安の {target}日に届きません"))
+    return issues
