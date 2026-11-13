@@ -52,9 +52,11 @@ def solve(
     time_limit: float = 20.0,
     seed: int = 1,
     weights: dict[str, int] | None = None,
+    progress=None,
 ) -> Result:
     """buildings を指定すると、その館の人だけ作り直す（ほかの館の人と応援は base のまま）。
-    weights で W の一部を置き換える（画面の「条件の強さ」から）。"""
+    weights で W の一部を置き換える（画面の「条件の強さ」から）。
+    progress(見つけた案の数, 点数, 経過秒) を、よりよい案が見つかるたびに呼ぶ。"""
     Wt = {**W, **{k: int(v) for k, v in (weights or {}).items()}}
     locked = dict(locked or {})
     target_b = set(buildings or BUILDINGS)
@@ -209,7 +211,19 @@ def solve(
     solver.parameters.num_workers = 8
     solver.parameters.random_seed = seed
     t0 = time.time()
-    st = solver.Solve(m)
+    if progress:
+        class _CB(cp_model.CpSolverSolutionCallback):
+            def __init__(self):
+                super().__init__()
+                self.n = 0
+
+            def on_solution_callback(self):
+                self.n += 1
+                progress(self.n, self.ObjectiveValue(), self.WallTime())
+
+        st = solver.Solve(m, _CB())
+    else:
+        st = solver.Solve(m)
     secs = time.time() - t0
     assign = {}
     if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):

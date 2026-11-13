@@ -8,12 +8,16 @@ from __future__ import annotations
 import datetime as dt
 import html
 import io
+import threading
+import time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
 from checks import daily_counts, fairness, find_issues, precheck
-from data import BUILDING_SHORT, BUILDINGS, HOLIDAYS, WEEKDAYS, fmt_date, is_weekend, make_facility
+from data import BUILDING_SHORT, BUILDINGS, HOLIDAYS, ROOMS, WEEKDAYS, fmt_date, is_weekend, make_facility
+from export import build_excel
 from demand import build_required, required_people, role_minimums
 from solver import OFF, W, solve
 
@@ -44,7 +48,7 @@ def init():
 
 
 init()
-for _k, _v in {"history": [], "future": [], "grid_ver": 0, "pending": None, "toast": None}.items():
+for _k, _v in {"history": [], "future": [], "grid_ver": 0, "pending": None, "toast": None, "log": [], "changes": [], "locked": False}.items():
     st.session_state.setdefault(_k, _v)
 if st.session_state.toast:
     st.toast(st.session_state.toast)
@@ -57,6 +61,32 @@ period_text = f"{fmt_date(dates[0])}〜{fmt_date(dates[-1])}（{fac.days}日間�
 
 def required():
     return build_required(fac.counts, ss.manual_req)
+
+
+def now_text():
+    return dt.datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%m/%d %H:%M:%S")
+
+
+def who():
+    return ss.get("user", "").split("（")[0]
+
+
+def log(op, detail, reason=""):
+    ss.log.append({"時刻": now_text(), "した人": who(), "操作": op, "内容": detail, "理由": reason})
+
+
+def record_cell(sid, d, before, after, op):
+    s = next(x for x in fac.staff if x.sid == sid)
+    ss.changes.append(
+        {
+            "時刻": now_text(), "した人": who(), "操作": op, "スタッフ": s.name, "館": s.home,
+            "日付": fmt_date(dates[d]), "前": before, "後": after, "確定後": "はい" if ss.confirmed else "",
+        }
+    )
+
+
+def editable():
+    return can_edit and not ss.locked
 
 
 # ---------- 左メニュー ----------
@@ -114,7 +144,7 @@ def page_home():
                 "スタッフ": f"{len(members)}人",
                 "休みの希望": f"{sub}/{len(members)}人が提出" + (f"（あと{len(members) - sub}人）" if sub < len(members) else ""),
                 "作成": "まだ" if ss.assign is None else STEPS[ss.step],
-                "確定": "確定済み" if ss.confirmed else "まだ",
+                "確定": f"確定済み（第{len(ss.confirmed)}版）" if ss.locked else ("確定解除中" if ss.confirmed else "まだ"),
             }
         )
     st.subheader("いまの状況")
@@ -144,15 +174,31 @@ def step2():
         df.columns = ["アウト", "連泊", "アウトイン", "露天風呂付き"]
         df.insert(0, "日付", [fmt_date(d) for d in dates])
         df["必要人数（自動）"] = [required_people(b, c) for c in fac.counts[b]]
+        rooms, roten_rooms = ROOMS[b]
+        num = lambda mx, h: st.column_config.NumberColumn(min_value=0, max_value=mx, step=1, help=h)
         edited = st.data_editor(
             df,
             hide_index=True,
             disabled=["日付", "必要人数（自動）"] if can_edit else True,
             key=f"counts_{b}",
             width="stretch",
+            column_config={
+                "アウト": num(rooms, f"0〜{rooms}室"),
+                "連泊": num(rooms, f"0〜{rooms}室"),
+                "アウトイン": num(rooms, f"0〜{rooms}室（アウトのうち、同じ日に次のお客さまが入る部屋）"),
+                "露天風呂付き": num(roten_rooms, f"0〜{roten_rooms}室"),
+            },
         )
+        warns = []
         for i, r in edited.iterrows():
-            fac.counts[b][i] = {"out": int(r["アウト"]), "stay": int(r["連泊"]), "outin": int(r["アウトイン"]), "roten": int(r["露天風呂付き"])}
+            out, stay, outin, roten = (int(r[c] or 0) for c in ("アウト", "連泊", "アウトイン", "露天風呂付き"))
+            if out + stay > rooms:
+                warns.append(f"{fmt_date(dates[i])}：アウトと連泊の合計 {out + stay}室 が、部屋数 {rooms}室 を超えています")
+            if outin > out:
+                warns.append(f"{fmt_date(dates[i])}：アウトイン {outin}室 が、アウト {out}室 より多いです")
+            fac.counts[b][i] = {"out": out, "stay": stay, "outin": outin, "roten": roten}
+        for w in warns:
+            st.warning(w, icon="⚠️")
     st.caption("必要人数＝（アウト90分・連泊30分・アウトインは＋20分・露天風呂付きは＋40分）÷1人300分 ＋ 大浴場や廊下の人数。目安は館ごとに直せる想定です。")
     next_button("次へ：③ 休み・人数の確認")
 
@@ -197,9 +243,16 @@ def step3():
         df = pd.DataFrame(
             {fmt_date(d): [req[b][i]] for i, d in enumerate(dates)}, index=[f"{b} 必要人数"]
         )
-        ed = st.data_editor(df, key=f"req_{b}", disabled=not can_edit, width="stretch")
+        pool = [s for s in fac.staff if s.home == b or b in s.can_help]
+        ed = st.data_editor(
+            df, key=f"req_{b}", disabled=not can_edit, width="stretch",
+            column_config={fmt_date(d): st.column_config.NumberColumn(min_value=1, max_value=len(pool), step=1, help=f"1〜{len(pool)}人（{b}で働ける人の数まで）") for d in dates},
+        )
         for i, d in enumerate(dates):
-            v = int(ed.iloc[0][fmt_date(d)])
+            v = int(ed.iloc[0][fmt_date(d)] or auto[i])
+            free = sum(1 for s in pool if fac.requests.get((s.sid, i)) != "必ず休み" and d.weekday() not in s.off_weekdays)
+            if v > free:
+                st.warning(f"{fmt_date(d)} {b}：必要 {v}人 に対して、出られる人は {free}人 です（必ず休み・出ない曜日を除く）", icon="⚠️")
             if v != auto[i]:
                 ss.manual_req[(b, i)] = v
             else:
@@ -258,6 +311,14 @@ def restore(state):
     ss.highlight = None
 
 
+def log_restore(op, before):
+    after = ss.assign or {}
+    diff = [k for k in set(before) | set(after) if before.get(k) != after.get(k)]
+    for sid, d in diff:
+        record_cell(sid, d, before.get((sid, d), ""), after.get((sid, d), ""), op)
+    log(op, f"{len(diff)}マスが変わりました")
+
+
 def allowed(s):
     return [s.home] + s.can_help + [OFF]
 
@@ -265,12 +326,39 @@ def allowed(s):
 def run_solve(p):
     req = required()
     locked = {k: ss.assign[k] for k in ss.edited} if (p["keep"] and ss.assign) else {}
-    with st.spinner("作成中です（50人で数秒〜20秒ほど）…"):
-        res = solve(fac, req, locked=locked, buildings=p["only"], base=ss.assign, time_limit=20, seed=p["seed"], weights=current_weights())
+    limit = ss.get("time_limit", 20)
+    state = {"n": 0, "obj": None}
+    box = {}
+
+    # 別のスレッドからは session_state を読めないので、ここで値を取り出しておく
+    args = dict(locked=locked, buildings=p["only"], base=ss.assign, time_limit=limit, seed=p["seed"], weights=current_weights())
+
+    def work():
+        try:
+            box["res"] = solve(fac, req, progress=lambda n, o, t: state.update(n=n, obj=o), **args)
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    bar = st.progress(0.0, text="作成を始めました…")
+    t0 = time.time()
+    while th.is_alive():
+        el = time.time() - t0
+        score = f"、いちばんよい案の点数 {state['obj']:,.0f}（小さいほどよい）" if state["obj"] is not None else ""
+        bar.progress(min(el / limit, 0.99), text=f"作成中 {el:.1f}秒／上限 {limit}秒　見つけた案 {state['n']}個{score}")
+        time.sleep(0.15)
+    th.join()
+    if "err" in box:
+        st.error(f"作成中にエラーが出ました：{box['err']}")
+        return
+    res = box["res"]
+    bar.progress(1.0, text=f"できました（{res.seconds:.1f}秒、見つけた案 {state['n']}個）")
     if not res.assign:
         st.error("案を作れませんでした。条件を見直してください。")
         return
     push_history()
+    log("自動作成", f"{'・'.join(p['only']) if p['only'] else '全館'}　{res.status}　{res.seconds:.1f}秒" + ("　手直しを残す" if locked else ""))
     ss.seed = p["seed"]
     ss.assign = res.assign
     ss.result = res
@@ -283,16 +371,16 @@ def run_solve(p):
 def priority_panel():
     with st.expander("条件の強さ（優先順位）", expanded=False):
         st.write("「必ず」は緩めると、守れないときに後回しにします。「なるべく」は大事な順に3つまで選べます。")
-        st.multiselect("緩める「必ず」", list(HARD_LABELS), format_func=HARD_LABELS.get, key="relax", placeholder="緩めない", disabled=not can_edit)
+        st.multiselect("緩める「必ず」", list(HARD_LABELS), format_func=HARD_LABELS.get, key="relax", placeholder="緩めない", disabled=not editable())
         st.multiselect(
             "特に大事にする「なるべく」（選んだ順に1位・2位・3位）",
-            list(SOFT_LABELS), format_func=SOFT_LABELS.get, max_selections=3, key="rank", placeholder="選ばない", disabled=not can_edit,
+            list(SOFT_LABELS), format_func=SOFT_LABELS.get, max_selections=3, key="rank", placeholder="選ばない", disabled=not editable(),
         )
         if ss.get("unused"):
             ss.unused = [k for k in ss.unused if k not in ss.get("rank", [])]
         st.multiselect(
             "使わない「なるべく」",
-            [k for k in SOFT_LABELS if k not in ss.get("rank", [])], format_func=SOFT_LABELS.get, key="unused", placeholder="すべて使う", disabled=not can_edit,
+            [k for k in SOFT_LABELS if k not in ss.get("rank", [])], format_func=SOFT_LABELS.get, key="unused", placeholder="すべて使う", disabled=not editable(),
         )
         w = current_weights()
         rows = [{"条件": v, "強さ": "必ず" + ("（緩める）" if k in ss.get("relax", []) else ""), "重み": w.get(k, W[k])} for k, v in HARD_LABELS.items()]
@@ -443,7 +531,7 @@ GRID_CSS = """
 
 def edit_tools(staff):
     cols = [fmt_date(d) for d in dates]
-    t1, t2, t3 = st.tabs(["マスを直す", "まとめて入れる", "入れ替える"])
+    t1, t2, t4, t3 = st.tabs(["マスを直す", "まとめて入れる", "コピーして貼り付け", "入れ替える"])
     with t1:
         edf = pd.DataFrame([{"名前": s.name, **{cols[d]: ss.assign[(s.sid, d)] for d in range(fac.days)}} for s in staff])
         cfg = {c: st.column_config.SelectboxColumn(c, options=BUILDINGS + [OFF], width="small") for c in cols}
@@ -459,35 +547,81 @@ def edit_tools(staff):
             if changes:
                 push_history()
                 for s, d, v in changes:
+                    record_cell(s.sid, d, ss.assign[(s.sid, d)], v, "マスを直す")
                     ss.assign[(s.sid, d)] = v
                     ss.edited.add((s.sid, d))
+                log("マスを直す", f"{len(changes)}マス")
             ss.toast = f"{len(changes)}マスを手直ししました" + (f"（{len(bad)}マスは行けない館なので入れていません）" if bad else "")
             ss.grid_ver += 1
             st.rerun()
     names = {s.name: s for s in staff}
     with t2:
         st.write("人と日の範囲を選んで、同じ内容をまとめて入れます。")
-        who = st.multiselect("人", list(names), placeholder="選んでください", key="rg_who")
+        targets = st.multiselect("人", list(names), placeholder="選んでください", key="rg_who")
         c1, c2, c3 = st.columns(3)
         d0 = c1.selectbox("から", range(fac.days), format_func=lambda d: cols[d], key="rg_d0")
         d1 = c2.selectbox("まで", range(fac.days), index=fac.days - 1, format_func=lambda d: cols[d], key="rg_d1")
         val = c3.selectbox("入れる内容", BUILDINGS + [OFF], index=len(BUILDINGS), key="rg_val")
-        if st.button("まとめて入れる", disabled=not who or d1 < d0):
+        if st.button("まとめて入れる", disabled=not targets or d1 < d0):
             push_history()
             n, skip = 0, 0
-            for nm in who:
+            for nm in targets:
                 s = names[nm]
                 if val not in allowed(s):
                     skip += 1
                     continue
                 for d in range(d0, d1 + 1):
+                    if ss.assign[(s.sid, d)] != val:
+                        record_cell(s.sid, d, ss.assign[(s.sid, d)], val, "まとめて入れる")
                     ss.assign[(s.sid, d)] = val
                     ss.edited.add((s.sid, d))
                     n += 1
+            log("まとめて入れる", f"{'、'.join(targets)} {cols[d0]}〜{cols[d1]} を「{val}」")
             ss.toast = f"{n}マスに「{val}」を入れました" + (f"（{skip}人は{val}へ行けないので入れていません）" if skip else "")
             st.rerun()
         if d1 < d0:
             st.caption("「まで」は「から」より後の日にしてください。")
+    with t4:
+        st.write("コピー元の人と日の範囲を選び、貼り付け先の人と始まりの日を選びます。コピー元が1人なら、貼り付け先の全員に同じものを貼ります。")
+        k1, k2, k3 = st.columns(3)
+        src = k1.multiselect("コピー元の人（上から順）", list(names), placeholder="選んでください", key="cp_src")
+        s0 = k2.selectbox("コピー元：から", range(fac.days), format_func=lambda d: cols[d], key="cp_d0")
+        s1 = k3.selectbox("コピー元：まで", range(fac.days), index=min(6, fac.days - 1), format_func=lambda d: cols[d], key="cp_d1")
+        k4, k5 = st.columns([2, 1])
+        dst = k4.multiselect("貼り付け先の人（上から順）", list(names), placeholder="選んでください", key="cp_dst")
+        t0_ = k5.selectbox("貼り付け先：始まりの日", range(fac.days), format_func=lambda d: cols[d], key="cp_t0")
+        n_days = s1 - s0 + 1
+        problem = ""
+        if src and dst and len(src) not in (1, len(dst)):
+            problem = f"コピー元は1人か、貼り付け先と同じ {len(dst)}人 にしてください。"
+        elif s1 < s0:
+            problem = "コピー元の「まで」は「から」より後の日にしてください。"
+        if problem:
+            st.caption(problem)
+        elif src and dst:
+            st.caption(f"{n_days}日分（{cols[s0]}〜{cols[s1]}）を、{cols[t0_]}から貼ります。期間の外にはみ出す分は貼りません。")
+        if st.button("貼り付ける", disabled=not src or not dst or bool(problem)):
+            push_history()
+            n, skip = 0, 0
+            for i, nm in enumerate(dst):
+                a_ = names[src[0] if len(src) == 1 else src[i]]
+                b_ = names[nm]
+                for k in range(n_days):
+                    d = t0_ + k
+                    if d >= fac.days:
+                        break
+                    v = ss.assign[(a_.sid, s0 + k)]
+                    if v not in allowed(b_):
+                        skip += 1
+                        continue
+                    if ss.assign[(b_.sid, d)] != v:
+                        record_cell(b_.sid, d, ss.assign[(b_.sid, d)], v, "コピーして貼り付け")
+                    ss.assign[(b_.sid, d)] = v
+                    ss.edited.add((b_.sid, d))
+                    n += 1
+            log("コピーして貼り付け", f"{'、'.join(src)} {cols[s0]}〜{cols[s1]} → {'、'.join(dst)} {cols[t0_]}から")
+            ss.toast = f"{n}マスに貼り付けました" + (f"（{skip}マスは行けない館なので貼っていません）" if skip else "")
+            st.rerun()
     with t3:
         st.write("2つのマスの中身を入れ替えます。同じ人の別の日でも、別の人の同じ日でもできます。")
         a1, a2, b1, b2 = st.columns(4)
@@ -502,6 +636,9 @@ def edit_tools(staff):
             st.caption(f"{pa} {cols[da]}「{va}」 ⇄ {pb} {cols[db]}「{vb}」")
             if st.button("入れ替える", disabled=not ok):
                 push_history()
+                record_cell(sa.sid, da, va, vb, "入れ替える")
+                record_cell(sb.sid, db, vb, va, "入れ替える")
+                log("入れ替える", f"{pa} {cols[da]} ⇄ {pb} {cols[db]}")
                 ss.assign[(sa.sid, da)], ss.assign[(sb.sid, db)] = vb, va
                 ss.edited.update({(sa.sid, da), (sb.sid, db)})
                 ss.toast = "入れ替えました"
@@ -540,11 +677,12 @@ def step4():
     req = required()
     priority_panel()
     c1, c2, c3 = st.columns([2, 2, 2])
-    scope = c1.radio("作る範囲", ["全館まとめて（応援も自動）", "表示中の館だけ"], horizontal=False, disabled=not can_edit)
-    keep = c2.checkbox("手直ししたマスは残して作り直す", value=True, disabled=ss.assign is None or not can_edit)
-    other = c3.button("別の案を作る", disabled=ss.assign is None or not can_edit)
+    scope = c1.radio("作る範囲", ["全館まとめて（応援も自動）", "表示中の館だけ"], horizontal=False, disabled=not editable())
+    keep = c2.checkbox("手直ししたマスは残して作り直す", value=True, disabled=ss.assign is None or not editable())
+    other = c3.button("別の案を作る", disabled=ss.assign is None or not editable())
+    c3.select_slider("考える時間の上限（秒）", [5, 10, 20, 40], value=20, key="time_limit", disabled=not editable(), help="時間内に見つかったいちばんよい案を出します。50人ならふつう数秒で終わります。")
     main_label = "自動でつくる" if ss.assign is None else "もう一度つくる"
-    go = st.button(main_label, type="primary" if ss.assign is None else "secondary", disabled=not can_edit, width="stretch")
+    go = st.button(main_label, type="primary" if ss.assign is None else "secondary", disabled=not editable(), width="stretch")
     if go or other:
         p = {
             "keep": keep,
@@ -607,13 +745,17 @@ def step4():
     role_f = g1.multiselect("役割", ["リーダー", "チェッカー", "クリーナー"], default=[], placeholder="すべて")
     grp_f = g2.multiselect("グループ", ["社員", "パート", "派遣", "新人"], default=[], placeholder="すべて")
     name_f = g3.text_input("名前で探す")
-    if g4.button(f"↶ 元に戻す（{len(ss.history)}）", disabled=not ss.history or not can_edit, width="stretch"):
+    if g4.button(f"↶ 元に戻す（{len(ss.history)}）", disabled=not ss.history or not editable(), width="stretch"):
+        before = dict(ss.assign)
         ss.future.append(snapshot())
         restore(ss.history.pop())
+        log_restore("元に戻す", before)
         st.rerun()
-    if g5.button(f"↷ やり直す（{len(ss.future)}）", disabled=not ss.future or not can_edit, width="stretch"):
+    if g5.button(f"↷ やり直す（{len(ss.future)}）", disabled=not ss.future or not editable(), width="stretch"):
+        before = dict(ss.assign)
         ss.history.append(snapshot())
         restore(ss.future.pop())
+        log_restore("やり直す", before)
         st.rerun()
     staff = [s for s in fac.staff if s.home in shown_buildings]
     if role_f:
@@ -629,40 +771,129 @@ def step4():
         "右の数字は出勤の日数で、赤＝少ない、青＝多い（以上・以下は週の目安から）。"
     )
     st.html(grid_html(ss.assign, staff, ss.highlight))
-    if can_edit:
+    if editable():
         st.markdown("##### 手直し")
         edit_tools(staff)
+    elif ss.locked:
+        st.info(f"確定済み（第{len(ss.confirmed)}版）なので直せません。直すときは⑤で確定解除してください。", icon="🔒")
     next_button("次へ：⑤ 確定・公開", help=None)
 
 
 # ---------- ⑤ ----------
+@st.dialog("勤務表を確定しますか？")
+def confirm_dialog(n_must, n_should, reason):
+    st.write(f"{period_text}　{'・'.join(shown_buildings) if bsel != 'すべての館' else '全館'}")
+    st.write(f"守れなかった条件：必ず {n_must}件・なるべく {n_should}件")
+    if reason:
+        st.write(f"理由：{reason}")
+    st.caption("確定すると、スタッフのスマホに出ます（試作なので送られません）。確定中は手直しできません。")
+    c1, c2 = st.columns(2)
+    if c1.button("確定する", type="primary", width="stretch"):
+        ss.confirmed.append({"assign": dict(ss.assign), "時刻": now_text(), "した人": who(), "理由": reason})
+        ss.locked = True
+        log("確定", f"第{len(ss.confirmed)}版　必ず{n_must}件・なるべく{n_should}件", reason)
+        st.rerun()
+    if c2.button("やめる", width="stretch"):
+        st.rerun()
+
+
+@st.dialog("確定を解除しますか？")
+def release_dialog(reason):
+    st.write(f"第{len(ss.confirmed)}版の確定を解除して、手直しできるようにします。")
+    st.write(f"理由：{reason}")
+    st.caption("解除したあとに直したマスは、変更履歴に「確定後」として残ります。")
+    c1, c2 = st.columns(2)
+    if c1.button("解除する", type="primary", width="stretch"):
+        ss.locked = False
+        log("確定解除", f"第{len(ss.confirmed)}版", reason)
+        st.rerun()
+    if c2.button("やめる", width="stretch"):
+        st.rerun()
+
+
+def history_section():
+    st.markdown("##### 変更履歴")
+    h1, h2 = st.tabs([f"操作（{len(ss.log)}件）", f"マスの変更（{len(ss.changes)}件）"])
+    with h1:
+        if ss.log:
+            ldf = pd.DataFrame(ss.log[::-1])
+            st.dataframe(ldf, hide_index=True, width="stretch", height=min(400, 38 + 35 * len(ldf)))
+            st.download_button("操作の記録をCSVで出す", ldf.to_csv(index=False).encode("utf-8-sig"), file_name="sousa_kiroku.csv", mime="text/csv")
+        else:
+            st.write("まだありません。")
+    with h2:
+        only_after = st.checkbox("確定後の変更だけ", key="only_after")
+        rows = [c for c in ss.changes if not only_after or c["確定後"]]
+        if rows:
+            cdf = pd.DataFrame(rows[::-1])
+            st.dataframe(cdf, hide_index=True, width="stretch", height=min(400, 38 + 35 * len(cdf)))
+            st.download_button("マスの変更をCSVで出す", cdf.to_csv(index=False).encode("utf-8-sig"), file_name="henkou_rireki.csv", mime="text/csv")
+        else:
+            st.write("まだありません。")
+    st.caption("自動作成・手直し・元に戻す・確定・確定解除を、だれが・いつ・何をしたか残します（試作ではブラウザを読み込み直すと消えます）。")
+
+
 def step5():
     if ss.assign is None:
         st.warning("まだ勤務表がありません。④で作ってください。")
         return
     req = required()
-    must = [i for i in find_issues(fac, ss.assign, req) if i.level == "必ず"]
-    if ss.confirmed:
-        st.success(f"確定しました（{len(ss.confirmed)}版目）。スタッフのスマホで見られます（試作なので送られません）。")
+    issues = [i for i in find_issues(fac, ss.assign, req) if i.building in shown_buildings]
+    must = [i for i in issues if i.level == "必ず"]
+    should = [i for i in issues if i.level == "なるべく"]
+    if ss.locked:
+        v = ss.confirmed[-1]
+        st.success(f"確定済み：第{len(ss.confirmed)}版（{v['時刻']}　{v['した人']}）。スタッフのスマホで見られます（試作なので送られません）。")
+        with st.expander("確定を解除する"):
+            reason = st.text_input("解除する理由（必須）", key="release_reason", placeholder="例：12/10に急な休みが出たため")
+            if st.button("確定を解除する", disabled=not can_edit or not reason.strip()):
+                release_dialog(reason.strip())
+            if not reason.strip():
+                st.caption("理由を入れると押せます。")
     else:
+        if ss.confirmed:
+            st.info(f"第{len(ss.confirmed)}版の確定を解除中です。直し終わったら、もう一度確定してください。")
+        reason = ""
         if must:
-            st.warning(f"「必ず」が {len(must)}件 残っています。このまま確定もできます。")
-        if st.button("確定して公開する", type="primary", disabled=not can_edit, width="stretch"):
-            ss.confirmed.append(dict(ss.assign))
-            st.rerun()
-    st.markdown("##### 給与・勤怠向けの出力")
-    st.write("月で締められるよう、期間とは別に日付の範囲を選べます。")
+            st.error(f"「必ず」の条件が {len(must)}件 守れていません。できれば④に戻って直してください。")
+            st.dataframe(pd.DataFrame([{"種類": i.kind, "内容": i.text} for i in must]), hide_index=True, width="stretch")
+            b1, _ = st.columns([1, 2])
+            if b1.button("④に戻って直す"):
+                ss.step = 3
+                st.rerun()
+            force = st.checkbox("「必ず」を守れないまま確定する（理由を残します）", key="force_confirm")
+            reason = st.text_input("理由（必須）", key="confirm_reason", placeholder="例：12/10は応援を頼んだので、当日に入れ替えます", disabled=not force)
+            ok = force and reason.strip()
+        else:
+            st.success(f"「必ず」はすべて守れています（なるべく {len(should)}件）。")
+            ok = True
+        if st.button("確定して公開する", type="primary", disabled=not can_edit or not ok, width="stretch"):
+            confirm_dialog(len(must), len(should), reason.strip())
+        if must and not ok:
+            st.caption("チェックを入れて理由を書くと、確定できます。")
+
+    st.markdown("##### 出力")
+    st.write("月で締められるよう、期間とは別に日付の範囲を選べます。出力は確定した版からです。")
     rng = st.date_input("出力する範囲", value=(dates[0], dates[-1]), format="YYYY/MM/DD")
-    rows = []
-    for s in fac.staff:
-        for d, date in enumerate(dates):
-            if isinstance(rng, tuple) and len(rng) == 2 and rng[0] <= date <= rng[1]:
-                v = ss.assign[(s.sid, d)]
-                rows.append({"社員番号": s.sid, "氏名": s.name, "日付": date.isoformat(), "勤務": "休み" if v == OFF else "出勤", "館": "" if v == OFF else v, "役割": "" if v == OFF else s.role})
-    csv = pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
-    st.download_button("CSVで出す", csv, file_name="kinmu.csv", mime="text/csv", disabled=not ss.confirmed)
-    if not ss.confirmed:
-        st.caption("出力は確定した勤務表だけです。")
+    src = ss.confirmed[-1]["assign"] if ss.locked else None
+    o1, o2 = st.columns(2)
+    if src and isinstance(rng, tuple) and len(rng) == 2:
+        rows = []
+        for s in fac.staff:
+            for d, date in enumerate(dates):
+                if rng[0] <= date <= rng[1]:
+                    v = src[(s.sid, d)]
+                    rows.append({"社員番号": s.sid, "氏名": s.name, "日付": date.isoformat(), "勤務": "休み" if v == OFF else "出勤", "館": "" if v == OFF else v, "役割": "" if v == OFF else s.role})
+        o1.download_button("給与・勤怠向けCSV", pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"), file_name="kinmu.csv", mime="text/csv", width="stretch")
+        ver = f"確定 第{len(ss.confirmed)}版（{ss.confirmed[-1]['時刻']}）"
+        xbytes = build_excel(fac, src, req, shown_buildings, ver, rng)
+        o2.download_button("勤務表（Excel・A4横）", xbytes, file_name=f"kinmuhyo_{rng[0]:%m%d}-{rng[1]:%m%d}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+        st.caption("Excelは館ごとのシートに、表題（館・期間・版）、承認欄、人ごとの日数、日ごとの人数（出勤・必要・過不足）を入れています。")
+    else:
+        o1.button("給与・勤怠向けCSV", disabled=True, width="stretch")
+        o2.button("勤務表（Excel・A4横）", disabled=True, width="stretch")
+        st.caption("確定すると出せます。" if not ss.confirmed else "確定解除中は出せません。もう一度確定してください。")
+    history_section()
 
 
 # ---------- スタッフ管理 ----------
@@ -739,7 +970,7 @@ def page_phone():
     left, _ = st.columns([1, 2])
     with left:
         with st.container(border=True):
-            if not ss.confirmed:
+            if not ss.locked:
                 st.markdown(f"**{period_text}の休みの希望**")
                 st.caption("締切 11/25(水) 18:00")
                 hard = sum(1 for d in range(fac.days) if fac.requests.get((s.sid, d)) == "必ず休み")
@@ -752,7 +983,7 @@ def page_phone():
                 st.caption(f"出しました（{sub.month}/{sub.day} {sub:%H:%M}）" if sub else "まだ出していません")
             else:
                 st.markdown(f"**{period_text}の勤務**")
-                a = ss.confirmed[-1]
+                a = ss.confirmed[-1]["assign"]
                 for d, date in enumerate(dates):
                     v = a[(s.sid, d)]
                     st.write(f"{fmt_date(date)}　{'休み' if v == OFF else v + '（' + s.role + '）'}")
