@@ -1,0 +1,3 @@
+streamlit==1.67.0
+ortools==9.15.6755
+pandas==3.0.5
